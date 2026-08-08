@@ -311,7 +311,7 @@ pipeline/extract.py  ── parse (vendored, patched mgz)
         │              ── on filter-reject  → data/quarantine/rejected.jsonl (reason logged, not silently dropped)
         │              ── on parse-exception → data/quarantine/failed.jsonl (best-effort save_version logged)
         ▼
-data/parquet/*.parquet  (matches / players / timeseries / uptimes / actions, sharded)
+data/parquet/*.parquet  (matches / players / timeseries / uptimes / actions / movements, sharded)
         │
         ▼
 dataset assembly (windowed sequences, split BY MATCH, vocab from train split only)
@@ -326,9 +326,49 @@ evaluation (held-out top-player matches, top-k accuracy vs. majority baseline)
 (future) RL fine-tuning — environment TBD, see Phase 7
 ```
 
+**Inspection side-path (not part of training):**
+`pipeline/to_json.py` dumps a replay's full parsed model to readable JSON
+for eyeballing — every field mgz produces, including the bulky `map.tiles`
+and `gaia` blocks. 6-10 MB per match vs. ~40 KB of parquet, so it's for
+debugging one replay at a time, never for bulk processing.
+
 ---
 
-## 6. TODO checklist
+## 6. Scripts: what's live, what was removed
+
+**Live (the pipeline):**
+
+| File | Role |
+|---|---|
+| `pipeline/config.py` | filters, action vocabularies, paths — single source of truth |
+| `pipeline/extract.py` | rec → filtered, sharded parquet. **This is the parser used for training data.** |
+| `pipeline/to_json.py` | rec → full readable JSON, inspection only |
+
+**Kept but currently broken — scheduled for rewrite, not deletion:**
+`supervised_training/{preprocess,train,model,data_loader,evaluate}.py`.
+None of these run today: they read the *old* per-replay JSON layout, and
+carry the specific bugs itemized in Phase 4 (O(n²) prefix rebuild, padding
+colliding with a real token id, unpacked LSTM sequences, split-by-sample
+leakage; `evaluate.py` additionally does `from train import model, ...`,
+which re-runs training as an import side effect). They're kept because
+Phase 4 rewrites them against `data/parquet/` and the model architecture is
+a reasonable starting point — deleting them would orphan ~8 TODO items that
+cite specific lines.
+
+**Removed 2026-08-09** (all recoverable from git history — they were
+committed in `0bf88b4`; every claim below was verified against the parsed
+data before deleting, not assumed):
+
+| File | Why removed |
+|---|---|
+| `my_parser.py` | Generated the old JSON dumps. Superseded by `pipeline/to_json.py`, which does the same thing with CLI args, error handling, and no import-time side effects (this one ran a parse on import). |
+| `Aoe2RecParser.py` | `process_frames()` iterates `match['frames']` — **that key does not exist** in mgz output (verified). Never worked. `get_army_composition()` counted `player['objects']`, which holds only the ~20 *starting* units, so it reported the same trivial result for every match regardless of what was built. |
+| `parse_frame_actions.py` | Same starting-objects mistake: "explored_tiles" derived from the 20 initial objects reports ~10 tiles as map exploration. Also ran `KMeans(n_clusters=3)` over 2 players' worth of vectors. |
+| `Bot1.py` | Could not run: depended on `tslearn`/`stable_baselines3`/`gym`/`matplotlib` (none installed), used the wrong import path for `DummyVecEnv`, and called `run_rl_in_aoe2()` at module scope (infinite loop on import). Every replay field it read — `resources`, `army_composition`, a flat numeric `actions` array — is absent from mgz output (verified). Its RL *design intent* is preserved in Phase 7 below. |
+
+---
+
+## 7. TODO checklist
 
 ### Phase 0 — Environment
 - [x] Native Windows venv with working wheel installs (`AOE2BOT/.venv`)
@@ -444,13 +484,38 @@ evaluation (held-out top-player matches, top-k accuracy vs. majority baseline)
       resemble known openings for the civs in the corpus?)
 
 ### Phase 7 — RL environment (major open problem, not blocking SL work)
-- [ ] Decide scope: macro/build-order policy only vs. full unit control
-      (recommended: start macro-only — it's achievable with SL alone and is
-      a real deliverable; full control needs an actual environment)
-- [ ] If full control: resolve the DE-packed `object_ids` decoding (§3) or
-      pick a different action interface
+- [ ] Decide scope: macro/build-order policy only vs. full unit control.
+      Note this is now *less* constrained than originally written — the
+      `movements` table (§4.2) means unit-control data is available, so
+      full control is a data-supported option, not just an aspiration.
+      The environment, not the data, is the remaining blocker.
 - [ ] Evaluate an abstracted macro simulator (fit from replay data) vs. a
       live-game hookup (memory read + input injection — real-time-only,
       ToS-adjacent, doesn't scale to RL sample counts) vs. openage
       (incomplete)
 - [ ] Define `step()` / `reset()` / reward once the above is decided
+
+**Salvaged design intent from the deleted `Bot1.py`** (see §6): that script
+was an early, non-functional sketch of exactly this phase. It could never
+run (depended on `tslearn`/`stable_baselines3`/`gym`, none installed; wrong
+import path for `DummyVecEnv`; called `run_rl_in_aoe2()` at module scope,
+so importing it would hang; and every field it read from the replay JSON
+— `resources`, `army_composition`, a flat numeric `actions` array — does
+not exist in mgz's output). Its assumptions are recorded here so the ideas
+aren't lost with the file:
+- **Algorithm:** PPO via `stable_baselines3`, `MlpPolicy`, 100k timesteps.
+- **Observation space:** `Box(11,)` = 4 resources + exploration% + 3 own
+  army counts + 3 enemy army counts. Note the enemy-army terms assume full
+  observability, which a real agent would not have (no fog of war) —
+  reconsider before reusing.
+- **Action space:** `Discrete(6)` = train infantry/cavalry/archers, gather
+  food/wood/gold. Far coarser than the §4.1 macro vocabulary already
+  extracted, and with no unit-control actions at all.
+- **Reward:** `own_army_strength - enemy_army_strength + resources/100`.
+  Naive (a pure army-count proxy ignores composition counters, and the
+  resource term rewards hoarding, which is anti-correlated with good play)
+  — treat as a starting point to argue with, not a baseline.
+- **IPC hack:** read game state from `aoe2_state.txt`/`aoe2_army.txt`,
+  write actions to `rl_commands.txt`. Nothing ever produced those files;
+  this was the placeholder for the unsolved "how do we actually talk to
+  the game" problem, which remains the core blocker above.
