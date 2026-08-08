@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Replay data -- large binaries and derived dumps, regenerate via the
+# pipeline (AOE2BOT/pipeline/extract.py) or re-fetch from source rather
+# than committing. See docs/PIPELINE.md.
+AOE2BOT/replays/*.aoe2record
+AOE2BOT/replays/*.json
+AOE2BOT/data/parquet/
+AOE2BOT/data/quarantine/
+AOE2BOT/data/manifest.jsonl
+
+# aoc-mgz-fork/ is its own git clone (for the upstream PR/issue prep) --
+# it has its own .git directory and history; do not nest it into this repo.
+AOE2BOT/aoc-mgz-fork/
+
+# vendored aoc-mgz build artifacts (the source patch itself IS tracked)
+AOE2BOT/aoc-mgz/mgz.egg-info/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

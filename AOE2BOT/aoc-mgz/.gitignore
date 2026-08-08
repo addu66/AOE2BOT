@@ -1,0 +1,7 @@
+dist/
+build/
+mgz.egg-info/
+venv/
+.tox/
+*.pyc
+*.sqlite

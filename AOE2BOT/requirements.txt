@@ -1,0 +1,16 @@
+# Install with: .venv/Scripts/python.exe -m pip install -r requirements.txt
+# then:         .venv/Scripts/python.exe -m pip install -e ./aoc-mgz
+# See docs/PIPELINE.md §1 for why this must be a native Windows Python
+# (not the MSYS2 mingw64 one) and §2 for why aoc-mgz is a vendored,
+# locally-patched copy rather than a PyPI install.
+#
+# torch is pinned to a CUDA 12.1 build; if reinstalling, use:
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+pandas==3.0.5
+pyarrow==25.0.0
+numpy==2.4.6
+scikit-learn==1.9.0
+torch==2.5.1
+construct==2.8.16
+tabulate==0.10.0
