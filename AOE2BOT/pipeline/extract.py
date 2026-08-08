@@ -9,6 +9,7 @@ Produces, under data/parquet/:
     timeseries_XXXX.parquet  ~365 rows per player per match (economy snapshot)
     uptimes_XXXX.parquet     up to 3 rows per player per match (age-ups)
     actions_XXXX.parquet     macro/decision-level actions (see config.MACRO_ACTION_TYPES)
+    movements_XXXX.parquet   unit-control actions: who/what/where (see config.MOVEMENT_ACTION_TYPES)
 
 And under data/quarantine/:
     rejected.jsonl   replays that parsed fine but failed a filter, with reason
@@ -157,26 +158,42 @@ def extract_one(match, mid: str, source_file: str, rows: dict) -> None:
         })
 
     for inp in match.inputs:
-        if inp.type not in config.MACRO_ACTION_TYPES:
-            continue
-        if inp.type == "Research" and inp.param in config.AGE_NAMES:
-            continue  # already represented via uptimes -> "Age Up"
-        payload = inp.payload or {}
-        entity_id = (
-            payload.get("unit_id")
-            or payload.get("building_id")
-            or payload.get("technology_id")
-            or payload.get("resource_id")
-        )
-        rows["actions"].append({
-            "match_id": mid,
-            "player_number": inp.player.number if inp.player else None,
-            "t_s": inp.timestamp.total_seconds(),
-            "type": inp.type,
-            "param": inp.param,
-            "entity_id": entity_id,
-            "amount": payload.get("amount"),
-        })
+        if inp.type in config.MACRO_ACTION_TYPES:
+            if inp.type == "Research" and inp.param in config.AGE_NAMES:
+                continue  # already represented via uptimes -> "Age Up"
+            payload = inp.payload or {}
+            entity_id = (
+                payload.get("unit_id")
+                or payload.get("building_id")
+                or payload.get("technology_id")
+                or payload.get("resource_id")
+            )
+            rows["actions"].append({
+                "match_id": mid,
+                "player_number": inp.player.number if inp.player else None,
+                "t_s": inp.timestamp.total_seconds(),
+                "type": inp.type,
+                "param": inp.param,
+                "entity_id": entity_id,
+                "amount": payload.get("amount"),
+            })
+
+        elif inp.type in config.MOVEMENT_ACTION_TYPES:
+            payload = inp.payload or {}
+            object_ids = payload.get("object_ids") or []
+            reliable = all(oid < config.OBJECT_ID_SUSPECT_THRESHOLD for oid in object_ids)
+            rows["movements"].append({
+                "match_id": mid,
+                "player_number": inp.player.number if inp.player else None,
+                "t_s": inp.timestamp.total_seconds(),
+                "type": inp.type,
+                "param": inp.param,
+                "object_ids": object_ids,
+                "target_id": payload.get("target_id"),
+                "target_x": inp.position.x if inp.position else None,
+                "target_y": inp.position.y if inp.position else None,
+                "reliable": reliable,
+            })
 
 
 def flush_shard(rows: dict, shard_idx: int) -> None:
@@ -218,7 +235,7 @@ def main():
         print(f"No .aoe2record files found in {args.replays_dir}")
         return
 
-    rows = {"matches": [], "players": [], "timeseries": [], "uptimes": [], "actions": []}
+    rows = {"matches": [], "players": [], "timeseries": [], "uptimes": [], "actions": [], "movements": []}
     shard_idx = 0
     n_ok = n_rejected = n_failed = 0
 

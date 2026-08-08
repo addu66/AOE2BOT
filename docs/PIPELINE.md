@@ -203,29 +203,49 @@ from `.aoe2record` files — no intermediate multi-MB JSON. One shard set per
 | `players` | 1 row / player (2 for 1v1) | `match_id`, `number`, `profile_id`, `name`, `civilization`, `team_id`, `winner`, `eapm`, `rate_snapshot` |
 | `timeseries` | ~365 rows / player / match | `match_id`, `player_number`, `t_s`, `total_resources`, `total_objects` — aggregate economy snapshot, ~6.5s sampling |
 | `uptimes` | ≤3 rows / player / match | `match_id`, `player_number`, `age`, `t_s` — exact age-up timestamps |
-| `actions` | variable | `match_id`, `player_number`, `t_s`, `type`, `param`, `entity_id`, `amount` — macro/decision-level only, see §4 |
+| `actions` | variable | `match_id`, `player_number`, `t_s`, `type`, `param`, `entity_id`, `amount` — macro/decision-level, see §4.1 |
+| `movements` | variable, largest table (~3.5k rows/match) | `match_id`, `player_number`, `t_s`, `type`, `param`, `object_ids` (list), `target_id`, `target_x`, `target_y`, `reliable` — unit-control, see §4.2 |
 
 **Deliberately not extracted (logged decision, not an oversight):**
 `map.tiles` (14,400 rows/match) and `gaia` (~15,500 rows/match) are dropped.
-They're static per map/seed and irrelevant to a macro/build-order policy;
-including them was the dominant cost in the old JSON (14MB → ~40KB parquot
-per match without them). Revisit only if a later phase needs terrain-aware
-features (e.g. wall placement, hill fighting).
+They're static per map/seed. Revisit if a later phase needs terrain-aware
+features (e.g. wall placement, hill fighting) — now more likely relevant
+than originally scoped, since §4.2 below means this pipeline is no longer
+build-order-only.
 
-**Object-id corruption, out of scope for v1:** two-thirds of `object_ids` in
-raw `Move`/`Order`/etc. inputs are DE's packed selection encoding, unresolved
-by this mgz version. This doesn't affect the macro vocabulary (§4), which
-never needs `object_ids` for micro-execution — but it means a *full-control*
-bot (as opposed to a macro/build-order policy) is blocked on either fixing
-that decoding or picking a different action interface entirely. Tracked in
-Phase 7.
+**Object-id corruption — narrower than first thought, and doesn't block
+`movements`.** An earlier version of this doc claimed "two-thirds of
+`object_ids` ... are DE-packed and unresolved" and scoped `movements`-type
+actions out entirely on that basis. That claim was wrong — it generalized
+from a hasty check on one older replay without verifying which action
+types were actually affected. Checked properly against `Hera_vs_MBL_1`
+(`save_version 68.0`): **0 of ~4500** `object_id` references across
+`Move`/`Order`/`Gather`/`Patrol`/`Gather Point` were anomalous. The real
+corruption (~4.7% of *all* object_id references in that replay) is
+narrowly confined to `Garrison`/`Ungarrison`/`Unqueue` — all excluded from
+`MOVEMENT_ACTION_TYPES` already. `movements.reliable` still flags any row
+whose `object_ids` exceed `config.OBJECT_ID_SUSPECT_THRESHOLD` as a guard
+against a future replay being less clean, rather than assuming this holds
+everywhere.
 
 ---
 
-## 4. Action vocabulary v1 (macro / decision-level)
+## 4. Action vocabulary v1
 
-`pipeline/config.py: MACRO_ACTION_TYPES` — the only `inputs[].type` values
-extracted into the `actions` table:
+**Why two tables, not one.** A model trained only on §4.1 (macro) learns
+*what to prioritize economically* — when to build a Barracks, when to age
+up — but has no way to actually play a game: it never learns to move a
+villager to a resource, send an army at a target, or retreat. That's not
+a viable "bot," bootstrap or otherwise — it's a build-order advisor. §4.2
+(movement) is what makes unit control learnable at all: who (`object_ids`),
+what kind of command, and where (`target_x`/`target_y` or `target_id`).
+They're kept as separate tables because the two are used differently
+downstream (macro → what-to-produce-next classifier; movement → spatial/
+targeting policy), not because either alone is "the" vocabulary.
+
+### 4.1 Macro / decision-level (`actions` table)
+
+`pipeline/config.py: MACRO_ACTION_TYPES`:
 
 - `Queue` — train unit (requires the fix in §2.1)
 - `Build` — place building
@@ -238,20 +258,45 @@ one-row-per-transition source) rather than sniffed out of `Research` entries;
 `Research` rows whose `param` is an age name are dropped to avoid
 double-counting.
 
-**Deliberately excluded:** `Move`, `Order`, `Gather`, `Gather Point`,
-`Attack Move`, `Target`, `Garrison`, `Ungarrison`, `Follow`, `Patrol`,
-`Formation`, `Stance`, `Delete`, `Stop`, `Repair`, `Back To Work`, `Unqueue`,
-`Reseed`, `Pack Trebuchet`, `Attack Ground`, `Chat`, `Resign`. These are
-micro-execution, not build-order decisions, and including them is actively
-harmful for a first model: `Move` alone is 48.8% of all raw inputs in the
-sanity replays, so a model trained on the full raw stream can hit ~49%
-"accuracy" by always predicting `Move` — a completely degenerate model that
-looks deceptively good on a naive metric. Confirmed by direct measurement on
-`Replay1`, see conversation history.
+A model trained on *only* this table (or on the full raw click stream
+without separating the two) risks a degenerate majority-class collapse:
+`Move` alone is 48.8% of all raw inputs in the sanity replays, so
+predicting `Move` unconditionally scores ~49% "accuracy" — deceptively
+good on a naive metric while learning nothing. Confirmed by direct
+measurement on `Replay1`. This is exactly why movement is its own table
+with its own target (predicting *where*/*who*, not just *whether* it's a
+`Move`) rather than folded into one flat vocabulary.
 
-This vocabulary is v1 and expected to be refined once the real corpus is
-extracted (e.g. `Unqueue` may be worth adding back as a cancel-decision
-signal).
+### 4.2 Movement / unit control (`movements` table)
+
+`pipeline/config.py: MOVEMENT_ACTION_TYPES`:
+
+- `Move` — move to a position, no combat stance
+- `Attack Move` — move to a position, engage anything encountered
+- `Order` — attack/interact with a specific target (unit or building)
+- `Gather` — start gathering a specific resource
+- `Gather Point` — set a building's rally point
+- `Patrol` — patrol between current position and a target
+- `Attack Ground` — target ground (e.g. siege) rather than a unit
+
+Each row carries `object_ids` (who's being commanded), `target_id` (if the
+command targets a specific object rather than a bare position), and
+`target_x`/`target_y`. **Not yet solved: unit-type attribution.** We know
+*which instance* is being moved (`object_ids`) and *where*, but not
+reliably *what kind of unit* it is, for anything created after the game's
+opening 20 starting units — `Queue`'s `object_ids` field identifies the
+*producing building*, not the *id assigned to the newly trained unit*, so
+there's no direct instance→type lookup in the parsed data today. Getting
+that (e.g. reconciling `Queue` completion times against the order new
+`object_ids` first appear, assuming DE assigns them roughly in creation
+order — untested assumption) is the next real piece of work if villager
+vs. military-unit distinction matters for the movement policy, and it's a
+bigger undertaking than anything fixed so far — tracked in Phase 4 below,
+not started.
+
+`Attack Move` and `Attack Ground` showed 0 rows in the replays extracted so
+far (small sample) — vocabulary correctness for those is unverified, not
+disproven.
 
 ---
 
@@ -342,6 +387,12 @@ evaluation (held-out top-player matches, top-k accuracy vs. majority baseline)
       all 3 new replays rather than 3 opaque failures
 - [ ] Load-test sharding/memory behavior at real corpus scale (hundreds–low
       thousands of matches)
+- [x] Added `movements` table (§4.2) — unit-control actions (`Move`/
+      `Attack Move`/`Order`/`Gather`/`Gather Point`/`Patrol`/`Attack Ground`)
+      with `object_ids`, target position/object, and a `reliable` flag.
+      Corrects an earlier wrong claim that these types' `object_ids` were
+      broadly DE-packed/unresolved — verified clean (0 anomalies in ~4500
+      refs) against `Hera_vs_MBL_1`.
 
 ### Phase 3 — Acquisition (top players / Arabia corpus)
 - [ ] Decide replay source(s) (aoe2insights.com, aoe2recs.com, tournament
@@ -367,6 +418,17 @@ evaluation (held-out top-player matches, top-k accuracy vs. majority baseline)
       (`train.py:33-35` currently does an 80/20 slice of a flat list, so val
       is just the tail of the last replay)
 - [ ] Build the action vocabulary from the train split only
+- [ ] **Unit-type attribution for `movements` rows** (§4.2, not started) —
+      reconcile `Queue` completion times against the order new `object_ids`
+      first appear in the action stream, to tag each movement with a unit
+      type (villager vs. specific military unit). Needed if the movement
+      policy should condition on/predict unit type, not just bare
+      instance ids. Untested assumption to validate first: whether DE
+      assigns `object_ids` in roughly creation order.
+- [ ] Decide how macro (`actions`) and movement (`movements`) tables
+      combine into one training example — interleaved single sequence
+      (harder, one vocabulary) vs. two coupled heads/models sharing a
+      state encoder (more like AlphaStar's split) — not decided yet
 
 ### Phase 5 — SL training loop fixes
 - [ ] More than 1 epoch (`train.py:48`) + early stopping / checkpointing
