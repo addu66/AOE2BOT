@@ -38,6 +38,16 @@ Windows-side tooling (permission denied — wrong-OS binary) and is not used by
 this pipeline. Only relevant from inside WSL; ignore or delete it to avoid
 confusion about which env is "the" env.
 
+**Git:** the project root (`d:/AgeProgramming`) is now a git repo (`main`
+branch). `AOE2BOT/aoc-mgz` was previously *also* its own nested clone of
+upstream `aoc-mgz` (predating this pipeline work) — that nested `.git` has
+been removed so it's tracked as plain vendored files in the main repo
+instead of silently becoming an empty "gitlink" with our patch stuck
+uncommitted inside it. `AOE2BOT/aoc-mgz-fork/` is a *separate*, intentional
+git clone of upstream used to prepare the PR/issue described in §2 below —
+it keeps its own git history and is gitignored from the main repo on
+purpose (see `.gitignore`).
+
 ---
 
 ## 2. Parsing bugs found & fixed
@@ -66,12 +76,72 @@ confusion about which env is "the" env.
   Don't `pip install mgz` from PyPI in place of the vendored copy, and don't
   refresh the vendored copy from upstream without re-applying/re-verifying
   this line.
-- **Not yet audited:** every other `Action.XXX` branch in the same file for
-  similar padding mistakes. Only `DE_QUEUE` was hunted down, because its
-  disappearance was visible in an aggregate type-frequency count. See TODO
-  Phase 1.
+- **PR prepared:** `AOE2BOT/aoc-mgz-fork/` branch `fix/de-queue-object-ids`,
+  one clean commit, ready to push to a fork and open against
+  `happyleavesaoc/aoc-mgz`. Draft PR body in that branch's
+  `PR_DRAFT_de_queue_fix.md` (delete before/after posting — not library code).
+- **Systematic audit, 2026-08-08:** instrumented `parse_action()` to record
+  attempt/failure counts per `Action` type across all 3 working sample
+  replays (Replay1-3, ~4500+ actions each). **Zero `struct.error` failures**
+  across the 25 action types actually exercised in that data (including
+  `DE_QUEUE`, now 1588/1588 successful, up from 0/1588 pre-fix). No other
+  systematic padding bugs found. Coverage caveat: the `Action` enum defines
+  68 members total; 43 were never exercised by these 3 replays and remain
+  unaudited (rare types like `TRIBUTE`, `CREATE`, `GUARD`,
+  `DE_MULTI_GATHERPOINT`, `TOWN_BELL`, ...) — re-run this audit once Phase 3
+  brings in a larger, more varied corpus.
 
-### 2.2 Old `Replay1.json` / `Replay2.json` dumps are stale
+### 2.2 `save_version 68.0` header parsing — **partially fixed, blocked**
+
+- File: [`AOE2BOT/aoc-mgz/mgz/fast/header.py`](../AOE2BOT/aoc-mgz/mgz/fast/header.py), `parse_de()`.
+- **Symptom:** the 3 new top-player replays (`Hera_vs_MBL_1/2`,
+  `Hera_vs_Margougou` — all `save_version 68.0`, `game_version VER 9.4`,
+  `build_version 180059`, added 2026-08-08) failed to parse *at all*:
+  `RuntimeError("could not parse: ")` (empty inner exception message) from
+  deep inside `parse_de()`.
+- **Root cause 1 (fixed):** the "custom civ pool" field's encoding changed.
+  Previously, `custom_civ_count > 0` was followed by that many 4-byte civ
+  ids. As of 68.0, it's followed by exactly **one** 4-byte value regardless
+  of the count (possibly a hash/bitmask of the pool — not confirmed).
+  Reading the old N-entry array consumes real header bytes belonging to the
+  *next* field, corrupting every subsequent read for that player slot.
+  Verified by byte-level hex inspection: located the real player-name string
+  ("VIT | Hera") in the decompressed header and walked backward to confirm
+  the exact framing.
+- **Root cause 2 (fixed):** an extra 4 reserved bytes (value `0` across all
+  3 samples — not game-specific data) appear right before the `rated`
+  field. Verified the same way: `rated`/`allow_specs`/`spec_delay` come out
+  as sane values (`1`/`1`/`120`) only with this skip in place, and the
+  following `string_block()` call's leading crc + marker land exactly where
+  expected afterward.
+- **Both fixes gated at `save >= 68.0`.** Caveat: there are zero data points
+  between `save_version 63.0` and `68.0`, so this cutoff is a guess pinned
+  to the only version observed failing — it may need adjusting once a
+  replay from that range surfaces.
+- **Still blocked:** with both fixes applied, `parse_de()` now runs to
+  completion without raising for all 3 replays (confirmed: all 8 per-player
+  loop slots decode with sane values — names, profile ids, handicaps — and
+  the function's first `string_block()` call locates its marker exactly
+  where expected). But the cursor position *after* `parse_de()` returns is
+  still wrong: the next function, `parse_metadata()`, reads `num_players=0`
+  instead of 2, which cascades into `parse_players()` raising `IndexError`.
+  This means at least one more undiscovered drift exists later in
+  `parse_de()` — most likely inside the `for _ in range(20): strings +=
+  string_block(...)` loop or the achievements section that follows.
+  `string_block()`'s own loop is self-resyncing (terminates on a small-crc
+  heuristic rather than a known length), which makes it harder to localize
+  the same way as the two fixes above — not yet traced.
+- **Issue prepared (not a PR — investigation incomplete):**
+  `AOE2BOT/aoc-mgz-fork/` branch `investigate/save-version-68`, one commit
+  with both fixes + a `parse_de()` docstring documenting current status.
+  Draft issue body in that branch's `ISSUE_DRAFT_save_version_68.md`.
+- **Practical impact on this project right now:** none of the 3 new
+  top-player replays can be extracted yet. They correctly quarantine as
+  `failed` (not silently dropped) in `data/quarantine/failed.jsonl`, now
+  logged with the real `save_version: 68.0` (see Phase 2 note below) so
+  they're easy to find and re-run once this is resolved.
+
+### 2.3 Old `Replay1.json` / `Replay2.json` dumps are stale
 
 Predate the vendored `aoc-mgz`'s `timeseries`/`uptimes` support entirely —
 `players[].objects` in those JSONs holds only the ~20 starting units
@@ -182,18 +252,51 @@ evaluation (held-out top-player matches, top-k accuracy vs. majority baseline)
 - [x] Native Windows venv with working wheel installs (`AOE2BOT/.venv`)
 - [x] pandas / pyarrow / numpy / scikit-learn / torch (+CUDA) installed
 - [x] Vendored `aoc-mgz` installed editable
+- [x] Root git repo initialized (`main` branch), `.gitignore` covering venv /
+      replay binaries / pipeline output / the separate `aoc-mgz-fork/` clone
 
 ### Phase 1 — Parsing fix
-- [x] Diagnose and fix `DE_QUEUE` → `Action.ERROR` bug
-- [ ] Audit remaining `Action.XXX` branches in `mgz/fast/actions.py` for the
-      same trailing-padding mistake (only `DE_QUEUE` has been hunted down so far)
-- [ ] Re-run against a wider replay sample (once Phase 3 corpus exists) to
-      catch version-specific parse failures beyond this one build
+- [x] Diagnose and fix `DE_QUEUE` → `Action.ERROR` bug (§2.1) — PR-ready
+      branch in `AOE2BOT/aoc-mgz-fork/`
+- [x] Audit remaining `Action.XXX` branches in `mgz/fast/actions.py` for the
+      same trailing-padding mistake — zero further systematic bugs found
+      among the 25 types exercised in the 3 sample replays; 43 types
+      unaudited for lack of data (§2.1)
+- [x] Re-ran against a wider replay sample (3 new top-player Arabia
+      replays, 2026-08-08) — surfaced a *new*, unrelated version-support
+      gap: `save_version 68.0` isn't fully handled yet (§2.2). Two of an
+      estimated three-or-more fixes landed and verified; parsing still
+      doesn't complete end-to-end for these 3 replays.
+- [ ] **Open:** find the remaining `save_version 68.0` drift inside
+      `parse_de()`'s 20x `string_block()` loop / achievements section
+      (§2.2) — needed before any of the 3 new top-player replays can be
+      extracted
+- [ ] Once resolved, re-run the Action.XXX audit (§2.1) against these 3
+      replays too — new civs/action patterns may exercise previously-untested
+      action types
+
+**Upstream contribution (`AOE2BOT/aoc-mgz-fork/`, gitignored from main repo):**
+- [x] `fix/de-queue-object-ids` branch — one clean, verified commit, ready
+      to push to a fork and open as a PR
+- [x] `investigate/save-version-68` branch — one WIP commit with the two
+      confirmed fixes, ready to post as a GitHub issue (not a PR — parsing
+      still incomplete)
+- [ ] Fork `happyleavesaoc/aoc-mgz` on GitHub, add as a remote, push both
+      branches (needs the user's GitHub credentials — not done by this
+      session)
+- [ ] Open the PR (using `PR_DRAFT_de_queue_fix.md` as the body) and the
+      issue (using `ISSUE_DRAFT_save_version_68.md` as the body), then
+      delete those two draft files from the branches
 
 ### Phase 2 — Compaction
 - [x] `pipeline/extract.py`: rec → filtered, sharded parquet tables
 - [x] Quarantine logging (rejected vs. failed, distinct reasons)
 - [x] Sanity-verified against the 3 sample replays (`--sanity` flag)
+- [x] `peek_version()` now uses `mgz.fast.header.parse_version()` directly
+      instead of the full (also-failing) header parse, so quarantined
+      failures log their real `save_version` instead of `null` — this is
+      what made the `save_version 68.0` pattern immediately visible across
+      all 3 new replays rather than 3 opaque failures
 - [ ] Load-test sharding/memory behavior at real corpus scale (hundreds–low
       thousands of matches)
 
