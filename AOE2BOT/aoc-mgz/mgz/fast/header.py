@@ -388,21 +388,23 @@ def string_block(data):
 def parse_de(data, version, save, skip=False):
     """Parse DE-specific header.
 
-    save_version 68.0 status: PARTIAL. Two structural changes vs. earlier
-    versions are confirmed and fixed below (custom civ pool encoding;
-    an extra reserved field before `rated`) -- verified against 3 distinct
-    replays, all save_version 68.0, by byte-level inspection. This function
-    now runs to completion without raising for those replays, but the
-    caller-side cursor position afterwards is still wrong: `parse_metadata`
-    (called right after `parse_de`+`parse_hd` in `parse()`) reads
-    num_players=0 instead of the correct value, meaning there is at least
-    one more undiscovered drift somewhere in the ~840 bytes of this function
-    between the first `string_block()` call (confirmed correct) and this
-    function's return -- most likely inside the `for _ in range(20):
-    strings += string_block(...)` loop or the achievements section below.
-    Not yet resolved; see docs/PIPELINE.md "Parsing bugs fixed" /
-    "save_version 68 -- open item" in the AgeProgramming project for the
-    full investigation writeup.
+    save_version 68.0 status: RESOLVED. Three structural changes vs.
+    earlier versions are fixed below and verified against 3 distinct
+    replays, all save_version 68.0, by byte-level inspection:
+      1. custom civ pool encoding (count field followed by one 4-byte
+         value instead of count*4 bytes)
+      2. an extra reserved field before `rated`
+      3. two extra settings strings near the achievements section --
+         adapted from happyleavesaoc/aoc-mgz PRs #139 and #142, which
+         address the same underlying change for save_version 67.0/67.2;
+         only this hunk from those PRs applies cleanly to 68.0 -- their
+         other hunk (an unconditional trailing de_string per player in
+         the loop below) does not match 68.0's data and was not adopted.
+    All three combined get parse_de() (and everything downstream: map,
+    players, scenario, lobby) parsing correctly end-to-end. Two further,
+    unrelated issues surfaced only after this function started returning
+    correct data -- see mgz/model/__init__.py's color/civilization
+    lookups and team-assignment logic (team_id == 0 handling).
     """
     if version is not Version.DE:
         return None
@@ -598,6 +600,17 @@ def parse_de(data, version, save, skip=False):
         data.read(c * 4)
     if not skip:
         de_string(data)
+        if save >= 67.2:
+            # Adapted from happyleavesaoc/aoc-mgz PRs #139 and #142 (both
+            # add this same hunk for save_version 67.2/67.0 respectively,
+            # "Last Chieftains" era). This is the fix that unblocks
+            # everything downstream of parse_de() for save_version 68.0 --
+            # without it, parse_metadata() reads num_players=0. See
+            # docs/PIPELINE.md "Parsing bugs fixed" for the full account,
+            # including why the *other* hunk in those PRs (a trailing
+            # de_string per player in the loop above) does NOT apply here.
+            de_string(data)
+            de_string(data)
         data.read(8)
         if save >= 37:
             timestamp, x = unpack('<II', data)

@@ -166,12 +166,20 @@ def parse_match(handle):
             if obj['object_id'] in TC_IDS:
                 pos_x = obj['position']['x']
                 pos_y = obj['position']['y']
+        # .get() with a fallback rather than a bare [...] lookup: `consts`
+        # (from aocref, already at its latest release) and `dataset` are
+        # reference tables that lag behind the game itself -- e.g.
+        # aocref 2.0.38 only maps player_colors 0-7, but DE has since added
+        # more selectable colors (observed color_id=15 in a real replay).
+        # A missing id shouldn't be a hard parse failure. Civilization
+        # fallback matches the pattern already used upstream in
+        # happyleavesaoc/aoc-mgz PR #139.
         players[player['number']] = Player(
             player['number'],
             player['name'].decode(encoding),
-            consts['player_colors'][str(player['color_id'])],
+            consts['player_colors'].get(str(player['color_id']), f"<Unknown color: {player['color_id']}>"),
             player['color_id'],
-            dataset['civilizations'][str(player['civilization_id'])]['name'],
+            dataset['civilizations'].get(str(player['civilization_id']), {'name': f"<Unknown civ: {player['civilization_id']}>"})['name'],
             player['civilization_id'],
             Position(pos_x, pos_y),
             [
@@ -195,9 +203,19 @@ def parse_match(handle):
     if de_players:
         by_team = collections.defaultdict(list)
         for number, player in de_players.items():
+            if number not in players:
+                continue  # empty/AI-placeholder slot, not a real player
             if player['team_id'] > 1:
                 by_team[player['team_id']].append(number)
-            elif player['team_id'] == 1:
+            elif player['team_id'] <= 1:
+                # team_id 1 has always meant "no team" (solo). As of a
+                # recent DE version (observed in save_version 68.0 replays),
+                # some players show team_id 0 with the same meaning instead
+                # -- previously only team_id == 1 was handled here, so a
+                # team_id == 0 player silently vanished from `teams`
+                # entirely (not even a team of one), which cascades into
+                # `Player.winner` never being set for them. Treat both the
+                # same: each gets their own solo team.
                 by_team[number + 9].append(number)
         team_ids = by_team.values()
     else:

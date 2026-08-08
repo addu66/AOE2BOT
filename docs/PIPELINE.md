@@ -91,55 +91,92 @@ purpose (see `.gitignore`).
   `DE_MULTI_GATHERPOINT`, `TOWN_BELL`, ...) — re-run this audit once Phase 3
   brings in a larger, more varied corpus.
 
-### 2.2 `save_version 68.0` header parsing — **partially fixed, blocked**
+### 2.2 `save_version 68.0` header parsing — **fixed, all 3 replays parse end-to-end**
 
-- File: [`AOE2BOT/aoc-mgz/mgz/fast/header.py`](../AOE2BOT/aoc-mgz/mgz/fast/header.py), `parse_de()`.
+- Files: [`AOE2BOT/aoc-mgz/mgz/fast/header.py`](../AOE2BOT/aoc-mgz/mgz/fast/header.py) (`parse_de()`), [`AOE2BOT/aoc-mgz/mgz/model/__init__.py`](../AOE2BOT/aoc-mgz/mgz/model/__init__.py) (color/civ lookup, team assignment).
 - **Symptom:** the 3 new top-player replays (`Hera_vs_MBL_1/2`,
   `Hera_vs_Margougou` — all `save_version 68.0`, `game_version VER 9.4`,
   `build_version 180059`, added 2026-08-08) failed to parse *at all*:
-  `RuntimeError("could not parse: ")` (empty inner exception message) from
-  deep inside `parse_de()`.
-- **Root cause 1 (fixed):** the "custom civ pool" field's encoding changed.
-  Previously, `custom_civ_count > 0` was followed by that many 4-byte civ
-  ids. As of 68.0, it's followed by exactly **one** 4-byte value regardless
-  of the count (possibly a hash/bitmask of the pool — not confirmed).
-  Reading the old N-entry array consumes real header bytes belonging to the
-  *next* field, corrupting every subsequent read for that player slot.
-  Verified by byte-level hex inspection: located the real player-name string
-  ("VIT | Hera") in the decompressed header and walked backward to confirm
-  the exact framing.
-- **Root cause 2 (fixed):** an extra 4 reserved bytes (value `0` across all
-  3 samples — not game-specific data) appear right before the `rated`
-  field. Verified the same way: `rated`/`allow_specs`/`spec_delay` come out
-  as sane values (`1`/`1`/`120`) only with this skip in place, and the
-  following `string_block()` call's leading crc + marker land exactly where
-  expected afterward.
-- **Both fixes gated at `save >= 68.0`.** Caveat: there are zero data points
-  between `save_version 63.0` and `68.0`, so this cutoff is a guess pinned
-  to the only version observed failing — it may need adjusting once a
-  replay from that range surfaces.
-- **Still blocked:** with both fixes applied, `parse_de()` now runs to
-  completion without raising for all 3 replays (confirmed: all 8 per-player
-  loop slots decode with sane values — names, profile ids, handicaps — and
-  the function's first `string_block()` call locates its marker exactly
-  where expected). But the cursor position *after* `parse_de()` returns is
-  still wrong: the next function, `parse_metadata()`, reads `num_players=0`
-  instead of 2, which cascades into `parse_players()` raising `IndexError`.
-  This means at least one more undiscovered drift exists later in
-  `parse_de()` — most likely inside the `for _ in range(20): strings +=
-  string_block(...)` loop or the achievements section that follows.
-  `string_block()`'s own loop is self-resyncing (terminates on a small-crc
-  heuristic rather than a known length), which makes it harder to localize
-  the same way as the two fixes above — not yet traced.
-- **Issue prepared (not a PR — investigation incomplete):**
-  `AOE2BOT/aoc-mgz-fork/` branch `investigate/save-version-68`, one commit
-  with both fixes + a `parse_de()` docstring documenting current status.
-  Draft issue body in that branch's `ISSUE_DRAFT_save_version_68.md`.
-- **Practical impact on this project right now:** none of the 3 new
-  top-player replays can be extracted yet. They correctly quarantine as
-  `failed` (not silently dropped) in `data/quarantine/failed.jsonl`, now
-  logged with the real `save_version: 68.0` (see Phase 2 note below) so
-  they're easy to find and re-run once this is resolved.
+  `RuntimeError("could not parse: ")` from deep inside `parse_de()`.
+  Fully resolved via four independent fixes, found across two rounds of
+  investigation (byte-level RE, then cross-referencing upstream open PRs).
+
+**Fix 1 — custom civ pool encoding changed (`parse_de`, own byte-level find):**
+Previously, `custom_civ_count > 0` was followed by that many 4-byte civ ids.
+As of `save_version` in `[63.0, 68.0)` this is unchanged; by `68.0` it's
+followed by exactly **one** 4-byte value regardless of the count (possibly a
+hash/bitmask of the pool — not confirmed). Reading the old N-entry array
+consumes real header bytes belonging to the *next* field, corrupting every
+subsequent read for that player slot. Verified by byte-level hex inspection:
+located the real player-name string ("VIT | Hera") in the decompressed
+header and walked backward to confirm the exact framing. Gated at
+`save >= 68.0` — no data points between `63.0` and `68.0` exist to pin the
+exact cutoff, so this may need adjusting.
+
+**Fix 2 — extra 4 reserved bytes before `rated` (`parse_de`, own byte-level find):**
+Value `0` across all 3 samples (not game-specific data). Verified the same
+way: `rated`/`allow_specs`/`spec_delay` only come out as sane values
+(`1`/`1`/`120`) with this skip in place. Same `save >= 68.0` caveat as fix 1.
+
+**Fix 3 — 2 extra settings strings near the achievements section (`parse_de`):**
+This is the fix that unblocked everything past `parse_metadata`
+(`num_players` was reading `0` instead of `2`, cascading into
+`parse_players()` raising `IndexError`). Found by checking upstream's open
+PRs rather than continuing the manual byte hunt: **[happyleavesaoc/aoc-mgz#139](https://github.com/happyleavesaoc/aoc-mgz/pull/139)**
+("Add support for The Last Chieftains in the fast parser", targeting
+`save_version 67.2`) and its sibling **[#142](https://github.com/happyleavesaoc/aoc-mgz/pull/142)**
+(same idea, `save_version 67.0`) both add two extra `de_string()` reads
+right before the achievements' `timestamp` read. Applying that exact hunk
+(gated `save >= 67.2`, which covers our `68.0` replays) got `parse_de()`
+producing a correct `num_players` for the first time.
+**Caveat on the other half of PR #139/#142:** both PRs *also* add an
+unconditional trailing `de_string()` read at the end of **every**
+per-player loop iteration (for a field unrelated to the civ pool). Tested
+that against our data and it does **not** match — it corrupts player slot 0
+(`MbL`), which byte-level inspection had already confirmed needs *zero*
+extra bytes. Fix 1 above (the civ-pool-conditional 4-byte read) remains the
+correct mechanism for `68.0`; whatever field PR #139/#142 added for `67.0`/`67.2`
+appears to have been superseded again by `68.0`. Only the achievements-section
+hunk (fix 3) was adopted from those PRs — not the per-player-loop hunk.
+
+**Fix 4 — stale color reference data, not a parsing bug at all (`mgz/model/__init__.py`):**
+Getting past `parse_de()` surfaced a *different* class of issue: `KeyError: '15'`
+from `consts['player_colors'][str(player['color_id'])]`. Traced this by
+printing the raw decoded value directly — `color_id=15` for one player,
+matching the exact byte read at the verified-correct offset. This isn't a
+parsing bug: `player['color_id']` is correctly decoded, but the `aocref`
+reference-data package (already at its latest release, `2.0.38`) only maps
+color ids `0`–`7`; DE has since added more selectable colors. Fixed with the
+same defensive-lookup pattern PR #139 already uses for unknown civilization
+ids: `.get(..., f"<Unknown color: {id}>")` instead of a bare `[...]` lookup,
+applied to both the color and (matching PR #139) the civilization lookup.
+
+**Fix 5 — `team_id == 0` not handled in team assignment (`mgz/model/__init__.py`):**
+With fixes 1–4 in place, all 3 replays parsed, but every player showed
+`winner=False` — including the one who clearly won (last input in each
+replay is a `Resign` from the *other* player). Traced to team assignment:
+the code only special-cased `team_id == 1` as "no team" (auto-solo-team);
+one player in each of the 3 replays has `team_id == 0` instead, which fell
+through both branches and silently never made it into `teams` at all — not
+even as a team of one. Since `Player.winner` is only ever set by iterating
+`teams`, that player's `winner` stayed at its default (`False`) regardless
+of the actual outcome. Fixed by treating `team_id <= 1` the same
+(solo team), with an added guard to skip empty/placeholder player slots
+(`number` not in the already-built `players` dict) so they don't get pulled
+into a team as a side effect of the same relaxed condition.
+
+**Verification:** all 3 new replays now parse fully via `parse_match()` —
+correct map (`Arabia`), civs, colors (with the new fallback), `winner`,
+`team`, `duration`, `inputs` (3446–7985 per replay), `uptimes` (4–6 per
+replay), and per-player `timeseries` (185–325 rows) — with **zero regression**
+on `Replay1-3` (re-verified after every fix). `pipeline/extract.py` run
+against all 6 replays: `ok=4 rejected=2(non-Arabia) failed=0`.
+
+**Upstream status:** fixes 1, 2, 4, 5 are ours (not in any known open PR);
+fix 3 is adapted from PR #139/#142 (both still open/unmerged upstream as of
+2026-08-08). Given the full picture now assembled, this is worth writing up
+as a genuinely complete PR rather than the WIP-issue framing from the first
+investigation round — see the updated Phase 1 TODO below.
 
 ### 2.3 Old `Replay1.json` / `Replay2.json` dumps are stale
 
@@ -264,29 +301,35 @@ evaluation (held-out top-player matches, top-k accuracy vs. majority baseline)
       unaudited for lack of data (§2.1)
 - [x] Re-ran against a wider replay sample (3 new top-player Arabia
       replays, 2026-08-08) — surfaced a *new*, unrelated version-support
-      gap: `save_version 68.0` isn't fully handled yet (§2.2). Two of an
-      estimated three-or-more fixes landed and verified; parsing still
-      doesn't complete end-to-end for these 3 replays.
-- [ ] **Open:** find the remaining `save_version 68.0` drift inside
-      `parse_de()`'s 20x `string_block()` loop / achievements section
-      (§2.2) — needed before any of the 3 new top-player replays can be
-      extracted
-- [ ] Once resolved, re-run the Action.XXX audit (§2.1) against these 3
-      replays too — new civs/action patterns may exercise previously-untested
-      action types
+      gap: `save_version 68.0` (§2.2). **Fully resolved** across 5 fixes
+      (2 own byte-level finds in `parse_de`, 1 adapted from upstream PRs
+      #139/#142, 2 more in `mgz/model/__init__.py` found after `parse_de`
+      itself was fixed: stale `aocref` color data, and a `team_id == 0`
+      gap that silently broke `winner` detection). All 3 new replays now
+      parse end-to-end with correct map/civs/colors/winner/team/actions.
+- [x] Re-ran the Action.XXX audit (§2.1) implicitly via full extraction of
+      the 3 new replays (2347 macro actions extracted, civs Armenians/
+      Britons/Vikings/Romans) — no new parse failures surfaced. Formal
+      per-type attempt/failure counts (like the original audit) not yet
+      re-run against these specifically; low priority given zero observed
+      failures.
 
 **Upstream contribution (`AOE2BOT/aoc-mgz-fork/`, gitignored from main repo):**
 - [x] `fix/de-queue-object-ids` branch — one clean, verified commit, ready
       to push to a fork and open as a PR
-- [x] `investigate/save-version-68` branch — one WIP commit with the two
-      confirmed fixes, ready to post as a GitHub issue (not a PR — parsing
-      still incomplete)
-- [ ] Fork `happyleavesaoc/aoc-mgz` on GitHub, add as a remote, push both
-      branches (needs the user's GitHub credentials — not done by this
-      session)
-- [ ] Open the PR (using `PR_DRAFT_de_queue_fix.md` as the body) and the
-      issue (using `ISSUE_DRAFT_save_version_68.md` as the body), then
-      delete those two draft files from the branches
+- [ ] `investigate/save-version-68` branch is now **stale** — it reflects
+      the mid-investigation, 2-of-5-fixes state and frames this as a WIP
+      issue rather than a complete fix. Needs redoing as a proper PR branch
+      with all 5 fixes, crediting PR #139/#142 for the achievements-section
+      hunk (fix 3) and explicitly noting the per-player-loop hunk from
+      those PRs does NOT apply to `68.0` (see §2.2). Delete
+      `ISSUE_DRAFT_save_version_68.md`, write a PR description instead.
+- [ ] Push `fix/de-queue-object-ids` and the redone save-68 branch to
+      `github.com/addu66/aoc-mgz` (remote already added by the user) and
+      open both as PRs against `happyleavesaoc/aoc-mgz`
+- [ ] Consider commenting on PR #139/#142 directly (rather than only opening
+      a new PR) since they're addressing the same underlying problem and a
+      maintainer may prefer consolidating
 
 ### Phase 2 — Compaction
 - [x] `pipeline/extract.py`: rec → filtered, sharded parquet tables
